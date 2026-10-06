@@ -790,6 +790,46 @@ impl CapFilesystem {
         Ok(file.into_std())
     }
 
+    #[cfg(target_os = "linux")]
+    pub async fn async_connect_unix(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<(tokio::net::UnixStream, PathBuf), std::io::Error> {
+        use cap_std::fs::OpenOptionsExt;
+        use std::os::unix::fs::FileTypeExt;
+
+        let path = self.relative_path(path.as_ref());
+
+        let inner = self.get_inner()?;
+        let filesystem = self.clone();
+        let (file, opened_path) = tokio::task::spawn_blocking(move || {
+            let file = inner
+                .open_with(
+                    path,
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(rustix::fs::OFlags::PATH.bits() as i32),
+                )?
+                .into_std();
+
+            if !file.metadata()?.file_type().is_socket() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a socket",
+                ));
+            }
+
+            let opened_path = filesystem.opened_relative_path(&file)?;
+
+            Ok::<_, std::io::Error>((file, opened_path))
+        })
+        .await??;
+
+        let stream = tokio::net::UnixStream::connect(proc_fd_path(&file)).await?;
+
+        Ok((stream, opened_path))
+    }
+
     pub async fn async_write(
         &self,
         path: impl AsRef<Path>,
@@ -2916,5 +2956,185 @@ mod tests {
         }
 
         assert_eq!(owner(outside.path().join("f")), outside_before);
+    }
+
+    // async_connect_unix
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn async_connect_unix_round_trips_bytes_and_reports_relative_path() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+            let listener = std::os::unix::net::UnixListener::bind(temp.path().join("s.sock"))?;
+
+            let (mut stream, path) = fs.async_connect_unix("/s.sock").await?;
+            assert_eq!(path, PathBuf::from("s.sock"));
+
+            let (mut accepted, _) = listener.accept()?;
+            stream.write_all(b"ping").await?;
+            stream.flush().await?;
+            let mut buf = [0; 4];
+            std::io::Read::read_exact(&mut accepted, &mut buf)?;
+            assert_eq!(&buf, b"ping");
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn async_connect_unix_reports_symlink_target_path() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+            std::fs::create_dir(temp.path().join("sub"))?;
+            let listener =
+                std::os::unix::net::UnixListener::bind(temp.path().join("sub/real.sock"))?;
+            std::os::unix::fs::symlink("sub/real.sock", temp.path().join("link.sock"))?;
+
+            let (_stream, path) = fs.async_connect_unix("link.sock").await?;
+            assert_eq!(path, PathBuf::from("sub/real.sock"));
+            listener.accept()?;
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn async_connect_unix_cannot_escape_the_root() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let outside = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+            let listener = std::os::unix::net::UnixListener::bind(outside.path().join("s.sock"))?;
+            listener.set_nonblocking(true)?;
+            std::os::unix::fs::symlink(
+                outside.path().join("s.sock"),
+                temp.path().join("absolute"),
+            )?;
+            let relative = Path::new("..")
+                .join(outside.path().file_name().unwrap())
+                .join("s.sock");
+            std::os::unix::fs::symlink(&relative, temp.path().join("relative"))?;
+
+            for path in [
+                Path::new("absolute"),
+                Path::new("relative"),
+                relative.as_path(),
+            ] {
+                let err = fs.async_connect_unix(path).await.unwrap_err();
+                assert!(
+                    matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::NotADirectory
+                    ),
+                    "{path:?}: {err:?}"
+                );
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "{path:?} reached the outside listener"
+                );
+            }
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn async_connect_unix_rejects_regular_file() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+            std::fs::write(temp.path().join("file"), "x")?;
+
+            let err = fs.async_connect_unix("file").await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn async_connect_unix_reports_missing_socket() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+
+            for path in ["missing.sock", "missing/s.sock"] {
+                let err = fs.async_connect_unix(path).await.unwrap_err();
+                assert!(
+                    matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound
+                            | std::io::ErrorKind::PermissionDenied
+                            | std::io::ErrorKind::NotADirectory
+                    ),
+                    "{path}: {err:?}"
+                );
+            }
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn async_connect_unix_refuses_stale_socket() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+            drop(std::os::unix::net::UnixListener::bind(
+                temp.path().join("s.sock"),
+            )?);
+
+            let err = fs.async_connect_unix("s.sock").await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn async_connect_unix_is_not_limited_by_sun_path_length() {
+        tokio_test::block_on(async {
+            let temp = tempfile::tempdir()?;
+            let fs = CapFilesystem::new(temp.path()).await?;
+            let deep = Path::new(&"a".repeat(60)).join("b".repeat(60));
+            std::fs::create_dir_all(temp.path().join(&deep))?;
+            // bind at a short path, then move the socket inode past the sun_path limit
+            let listener = std::os::unix::net::UnixListener::bind(temp.path().join("s.sock"))?;
+            std::fs::rename(
+                temp.path().join("s.sock"),
+                temp.path().join(&deep).join("s.sock"),
+            )?;
+            assert!(temp.path().join(&deep).join("s.sock").as_os_str().len() > 108);
+
+            let (mut stream, path) = fs.async_connect_unix(deep.join("s.sock")).await?;
+            assert_eq!(path, deep.join("s.sock"));
+
+            let (mut accepted, _) = listener.accept()?;
+            stream.write_all(b"ping").await?;
+            stream.flush().await?;
+            let mut buf = [0; 4];
+            std::io::Read::read_exact(&mut accepted, &mut buf)?;
+            assert_eq!(&buf, b"ping");
+
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap();
     }
 }
