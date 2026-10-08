@@ -15,8 +15,15 @@ mod get {
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
     };
+    use anyhow::Context;
     use serde::Serialize;
     use utoipa::ToSchema;
+
+    #[derive(ToSchema, Serialize)]
+    struct BandwidthStatus {
+        ready: bool,
+        reason: Option<String>,
+    }
 
     #[derive(ToSchema, Serialize)]
     struct Response<'a> {
@@ -25,18 +32,31 @@ mod get {
         kernel_version: String,
         os: &'static str,
         version: &'a str,
+        bandwidth: BandwidthStatus,
     }
 
     #[utoipa::path(get, path = "/", responses(
         (status = OK, body = inline(Response)),
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.executor.bandwidth_ready(),
+        )
+        .await
+        .context("bandwidth readiness check timed out")
+        .and_then(|result| result);
+
         ApiResponse::new_serialized(Response {
             architecture: std::env::consts::ARCH,
             cpu_count: rayon::current_num_threads(),
             kernel_version: sysinfo::System::kernel_long_version(),
             os: std::env::consts::OS,
             version: &state.version,
+            bandwidth: BandwidthStatus {
+                ready: result.is_ok(),
+                reason: result.err().map(|err| format!("{err:#}")),
+            },
         })
         .ok()
     }

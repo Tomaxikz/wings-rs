@@ -17,6 +17,7 @@ use crate::io::SafeSliceExt;
 
 pub mod activity;
 pub mod backup;
+pub mod bandwidth;
 pub mod collab;
 pub mod configuration;
 pub mod diff;
