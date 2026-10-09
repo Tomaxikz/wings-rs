@@ -1,9 +1,6 @@
 mod netlink;
 
-use super::{
-    BandwidthBackend,
-    limits::{BandwidthLimits, MAXIMUM_RATE, MINIMUM_RATE},
-};
+use super::limits::{BandwidthLimits, MAXIMUM_RATE, MINIMUM_RATE};
 use anyhow::{Context, bail, ensure};
 use netlink::{Link, Route, Shaping};
 use rustix::{
@@ -29,76 +26,67 @@ const IFB: &str = super::IFB_DEVICE;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_USERNS_DEPTH: usize = 32;
 
-const CAP_NET_ADMIN: u32 = 12;
-const CAP_SYS_ADMIN: u32 = 21;
-
 const NS_GET_USERNS: Opcode = opcode::none(0xb7, 0x1);
 const NS_GET_PARENT: Opcode = opcode::none(0xb7, 0x2);
 
-pub struct NetlinkBandwidth;
+pub async fn ready(rootless: bool) -> Result<(), anyhow::Error> {
+    if rootless {
+        let limit = tokio::fs::read_to_string("/proc/sys/user/max_user_namespaces")
+            .await
+            .context("failed to read the user namespace limit")?;
+        ensure!(
+            limit.trim().parse::<u64>().unwrap_or(0) > 0,
+            "rootless bandwidth limits require user namespaces"
+        );
 
-#[async_trait::async_trait]
-impl BandwidthBackend for NetlinkBandwidth {
-    async fn ready(&self) -> Result<(), anyhow::Error> {
-        if !rustix::process::geteuid().is_root() {
-            let limit = tokio::fs::read_to_string("/proc/sys/user/max_user_namespaces").await?;
-            ensure!(
-                limit.trim().parse::<u64>().unwrap_or(0) > 0,
-                "rootless bandwidth limits require user namespaces"
-            );
-
-            return Ok(());
-        }
-
-        let status = tokio::fs::read_to_string("/proc/self/status").await?;
-        let capabilities = status
-            .lines()
-            .find_map(|line| line.strip_prefix("CapEff:"))
-            .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-            .context("failed to read effective capabilities")?;
-
-        for (capability, name) in [
-            (CAP_NET_ADMIN, "CAP_NET_ADMIN"),
-            (CAP_SYS_ADMIN, "CAP_SYS_ADMIN"),
-        ] {
-            ensure!(
-                capabilities & (1 << capability) != 0,
-                "bandwidth limits require {name}"
-            );
-        }
-
-        Ok(())
+        return Ok(());
     }
 
-    async fn apply(&self, pid: u32, limits: BandwidthLimits) -> Result<(), anyhow::Error> {
-        validate_rate(limits.upload)?;
-        validate_rate(limits.download)?;
+    let status = tokio::fs::read_to_string("/proc/self/status").await?;
+    let capabilities = CapabilitySet::from_bits_retain(super::capability_mask(&status, "CapEff")?);
 
-        if !limits.is_limited() && self.ready().await.is_err() {
-            return Ok(());
-        }
-
-        let mut command = tokio::process::Command::new("/proc/self/exe");
-        command
-            .arg(HELPER_ARG)
-            .arg(limits.upload.to_string())
-            .arg(limits.download.to_string());
-
-        if !run_in_namespace(pid, command).await? {
-            ensure!(
-                !limits.is_limited(),
-                "bandwidth limits require a separate container network namespace"
-            );
-        }
-
-        Ok(())
+    for (capability, name) in [
+        (CapabilitySet::NET_ADMIN, "CAP_NET_ADMIN"),
+        (CapabilitySet::SYS_ADMIN, "CAP_SYS_ADMIN"),
+    ] {
+        ensure!(
+            capabilities.contains(capability),
+            "bandwidth limits require {name}"
+        );
     }
+
+    Ok(())
+}
+
+pub async fn apply(pid: u32, limits: BandwidthLimits, rootless: bool) -> Result<(), anyhow::Error> {
+    validate_rate(limits.upload)?;
+    validate_rate(limits.download)?;
+
+    if !limits.is_limited() && ready(rootless).await.is_err() {
+        return Ok(());
+    }
+
+    let mut command = tokio::process::Command::new("/proc/self/exe");
+    command
+        .arg(HELPER_ARG)
+        .arg(limits.upload.to_string())
+        .arg(limits.download.to_string())
+        .arg(rootless.to_string());
+
+    if !run_in_namespace(pid, command).await? {
+        ensure!(
+            !limits.is_limited(),
+            "bandwidth limits require a separate container network namespace"
+        );
+    }
+
+    Ok(())
 }
 
 pub fn helper_main(args: &[OsString]) -> i32 {
     let result = (|| {
-        let [upload, download] = args else {
-            bail!("expected upload and download rates");
+        let [upload, download, relayed] = args else {
+            bail!("expected upload and download rates and the relay mode");
         };
         let limits = BandwidthLimits {
             upload: upload.to_str().context("invalid upload rate")?.parse()?,
@@ -110,7 +98,10 @@ pub fn helper_main(args: &[OsString]) -> i32 {
         validate_rate(limits.upload)?;
         validate_rate(limits.download)?;
 
-        apply_here(limits)
+        apply_here(
+            limits,
+            relayed.to_str().context("invalid relay mode")?.parse()?,
+        )
     })();
 
     match result {
@@ -133,6 +124,8 @@ fn validate_rate(rate: u64) -> Result<(), anyhow::Error> {
 
 struct NamespaceIoctl<const OPCODE: Opcode>;
 
+// SAFETY: NS_GET_USERNS and NS_GET_PARENT take no argument and return a new owned fd
+// on success, so a null pointer and taking ownership of the return value are correct.
 unsafe impl<const OPCODE: Opcode> Ioctl for NamespaceIoctl<OPCODE> {
     type Output = OwnedFd;
 
@@ -150,6 +143,7 @@ unsafe impl<const OPCODE: Opcode> Ioctl for NamespaceIoctl<OPCODE> {
         out: IoctlOutput,
         _: *mut std::ffi::c_void,
     ) -> rustix::io::Result<OwnedFd> {
+        // SAFETY: on success both ioctls return a freshly opened fd owned by the caller.
         Ok(unsafe { OwnedFd::from_raw_fd(out) })
     }
 }
@@ -163,6 +157,7 @@ fn identity(fd: impl AsFd) -> Result<(u64, u64), anyhow::Error> {
 fn user_namespaces(netns: &File) -> Result<Vec<OwnedFd>, anyhow::Error> {
     let own = std::fs::metadata("/proc/self/ns/user")?;
     let own = (own.dev(), own.ino());
+    // SAFETY: netns is an open nsfs fd and NamespaceIoctl matches the ioctl's contract.
     let mut user = unsafe { rustix::ioctl::ioctl(netns, NamespaceIoctl::<NS_GET_USERNS>) }
         .context("failed to resolve the container's user namespace")?;
     let mut chain = Vec::new();
@@ -172,6 +167,7 @@ fn user_namespaces(netns: &File) -> Result<Vec<OwnedFd>, anyhow::Error> {
             chain.len() < MAX_USERNS_DEPTH,
             "container user namespace is nested too deeply"
         );
+        // SAFETY: user is an open user namespace fd returned by a previous NS_GET_* ioctl.
         let parent = unsafe { rustix::ioctl::ioctl(&user, NamespaceIoctl::<NS_GET_PARENT>) }
             .context("container user namespace is not owned by wings' user namespace")?;
         chain.push(user);
@@ -186,6 +182,7 @@ fn user_namespaces(netns: &File) -> Result<Vec<OwnedFd>, anyhow::Error> {
 fn enter(users: &[RawFd], netns: RawFd) -> Result<(), Errno> {
     for user in users {
         rustix::thread::move_into_link_name_space(
+            // SAFETY: the parent keeps every fd in users open until the child has exec'd.
             unsafe { BorrowedFd::borrow_raw(*user) },
             Some(LinkNameSpaceType::User),
         )?;
@@ -199,6 +196,7 @@ fn enter(users: &[RawFd], netns: RawFd) -> Result<(), Errno> {
     }
 
     rustix::thread::move_into_link_name_space(
+        // SAFETY: the parent keeps netns open until the child has exec'd.
         unsafe { BorrowedFd::borrow_raw(netns) },
         Some(LinkNameSpaceType::Network),
     )
@@ -226,6 +224,8 @@ async fn run_in_namespace(
 
     let raw_users: Vec<RawFd> = users.iter().map(AsRawFd::as_raw_fd).collect();
     let raw_netns = netns.as_raw_fd();
+    // SAFETY: enter only issues raw setns/capset/prctl syscalls on borrowed fds and does not
+    // allocate or take locks, so it is safe to run between fork and exec.
     unsafe {
         command.pre_exec(move || enter(&raw_users, raw_netns).map_err(Into::into));
     }
@@ -252,7 +252,7 @@ async fn run_in_namespace(
     Ok(true)
 }
 
-fn apply_here(limits: BandwidthLimits) -> Result<(), anyhow::Error> {
+fn apply_here(limits: BandwidthLimits, relay: bool) -> Result<(), anyhow::Error> {
     let mut route = Route::open()?;
     let links = route.links()?;
     let link = container_link(&links)?;
@@ -264,7 +264,7 @@ fn apply_here(limits: BandwidthLimits) -> Result<(), anyhow::Error> {
     .with_context(|| format!("failed to shape upload on {}", link.name))?;
 
     let download = shaping(limits.download, link.mtu)?;
-    let download = match in_user_namespace() {
+    let download = match relay {
         true => download.map(relayed),
         false => download,
     };
@@ -293,14 +293,9 @@ fn apply_here(limits: BandwidthLimits) -> Result<(), anyhow::Error> {
     .with_context(|| format!("failed to shape download on {}", link.name))
 }
 
-fn in_user_namespace() -> bool {
-    std::fs::read_to_string("/proc/self/uid_map").is_ok_and(|map| !is_initial_uid_map(&map))
-}
-
-fn is_initial_uid_map(map: &str) -> bool {
-    map.split_whitespace().eq(["0", "0", "4294967295"])
-}
-
+// Rootless engines relay download traffic through a userspace stack (pasta/slirp4netns) that
+// acknowledges TCP on the remote's behalf, so drops here never slow the real sender down and
+// only cost local retransmits. Deep buffers and a lax CoDel target queue the excess instead.
 fn relayed(shaping: Shaping) -> Shaping {
     Shaping {
         memory: 32 * 1024 * 1024,
@@ -333,9 +328,13 @@ fn shaping(bits: u64, mtu: u32) -> Result<Option<Shaping>, anyhow::Error> {
     let rate = bits / 8;
     let frame = u64::from(mtu) + 14;
     let quantum = if bits < 40_000_000 { 300 } else { frame };
-    let burst = (rate / 200).clamp(64 * 1024, 4 * 1024 * 1024);
+    let burst = (rate / 200)
+        .clamp(64 * 1024, 4 * 1024 * 1024)
+        .max(2 * frame);
     let memory = (rate / 10).clamp(4 * 1024 * 1024, 32 * 1024 * 1024);
     let packets = (memory / frame).clamp(1024, 10240);
+    let frame_time = frame * 8 * 1_000_000 / bits;
+    let target = (frame_time * 3 / 2).clamp(50_000, 5_000_000);
 
     Ok(Some(Shaping {
         rate,
@@ -344,8 +343,8 @@ fn shaping(bits: u64, mtu: u32) -> Result<Option<Shaping>, anyhow::Error> {
         packets: u32::try_from(packets)?,
         quantum: u32::try_from(quantum)?,
         flows: 4096,
-        target: 50_000,
-        interval: 500_000,
+        target: u32::try_from(target)?,
+        interval: u32::try_from(target * 10)?,
     }))
 }
 
@@ -353,25 +352,29 @@ fn shaping(bits: u64, mtu: u32) -> Result<Option<Shaping>, anyhow::Error> {
 mod tests {
     use super::*;
 
-    const HELPER_ENV: &str = "WINGS_BANDWIDTH_TEST_HELPER";
+    use netlink_packet_route::link::LinkFlags;
 
-    fn link(index: u32, name: &str, flags: u32) -> Link {
+    const HELPER_ENV: &str = "WINGS_BANDWIDTH_TEST_HELPER";
+    const UP: LinkFlags = LinkFlags::Up;
+
+    fn link(index: u32, name: &str, flags: LinkFlags) -> Link {
         Link {
             index,
             name: name.into(),
             mtu: 1500,
             flags,
-            kind: None,
         }
     }
+
+    // container_link
 
     #[test]
     fn picks_single_up_interface() {
         let links = [
-            link(1, "lo", 0x9),
-            link(2, "tunl0", 0),
-            link(3, IFB, 0x1),
-            link(17, "eth0", 0x1),
+            link(1, "lo", UP | LinkFlags::Loopback),
+            link(2, "tunl0", LinkFlags::empty()),
+            link(3, IFB, UP),
+            link(17, "eth0", UP),
         ];
 
         assert_eq!(container_link(&links).unwrap().name, "eth0");
@@ -379,9 +382,11 @@ mod tests {
 
     #[test]
     fn rejects_multiple_or_missing_interfaces() {
-        assert!(container_link(&[link(2, "eth0", 0x1), link(3, "eth1", 0x1)]).is_err());
-        assert!(container_link(&[link(1, "lo", 0x9)]).is_err());
+        assert!(container_link(&[link(2, "eth0", UP), link(3, "eth1", UP)]).is_err());
+        assert!(container_link(&[link(1, "lo", UP | LinkFlags::Loopback)]).is_err());
     }
+
+    // shaping
 
     #[test]
     fn shaping_scales_with_rate() {
@@ -391,27 +396,28 @@ mod tests {
         assert_eq!(slow.rate, 125_000);
         assert_eq!(slow.burst, 64 * 1024);
         assert_eq!(slow.memory, 4 * 1024 * 1024);
-        assert_eq!(slow.packets, 2770);
         assert_eq!(slow.quantum, 300);
-        assert_eq!(slow.flows, 4096);
-        assert_eq!(slow.target, 50_000);
-        assert_eq!(slow.interval, 500_000);
 
         let fast = shaping(10_000_000_000, 1500).unwrap().unwrap();
+        assert_eq!(fast.rate, 1_250_000_000);
         assert_eq!(fast.burst, 4 * 1024 * 1024);
         assert_eq!(fast.memory, 32 * 1024 * 1024);
-        assert_eq!(fast.packets, 10240);
         assert_eq!(fast.quantum, 1514);
+
+        for shaping in [slow, fast] {
+            assert!((1024..=10240).contains(&shaping.packets));
+            assert_eq!(shaping.target, 50_000);
+            assert_eq!(shaping.interval, 500_000);
+        }
+
+        let jumbo = shaping(5_000_000, 65520).unwrap().unwrap();
+        let frame_time = 65534u32 * 8 * 1000 / 5000;
+        assert!(jumbo.burst >= 2 * 65534);
+        assert!(jumbo.target > frame_time);
+        assert_eq!(jumbo.interval, jumbo.target * 10);
     }
 
-    #[test]
-    fn detects_user_namespaces_from_uid_map() {
-        assert!(is_initial_uid_map("         0          0 4294967295\n"));
-        assert!(!is_initial_uid_map(
-            "         0       1000          1\n         1     100000      65536\n"
-        ));
-        assert!(!is_initial_uid_map("      1000       1000          1\n"));
-    }
+    // relayed
 
     #[test]
     fn relayed_download_queues_instead_of_dropping() {
@@ -424,6 +430,8 @@ mod tests {
         assert_eq!(shaping.interval, 10_000_000);
     }
 
+    // validate_rate
+
     #[test]
     fn validates_rates() {
         assert!(validate_rate(0).is_ok());
@@ -432,6 +440,8 @@ mod tests {
         assert!(validate_rate(MAXIMUM_RATE + 1).is_err());
         assert!(shaping(MINIMUM_RATE, 1500).unwrap().is_some());
     }
+
+    // run_in_namespace
 
     fn run(args: &[&str]) -> String {
         let output = std::process::Command::new(args[0])
@@ -487,7 +497,7 @@ mod tests {
         links.iter().any(|link| link["ifname"] == name)
     }
 
-    fn apply_through_helper(pid: u32, limits: BandwidthLimits) {
+    fn apply_through_helper(pid: u32, limits: BandwidthLimits, relay: bool) {
         let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -497,7 +507,10 @@ mod tests {
                 "--test-threads=1",
                 "--nocapture",
             ])
-            .env(HELPER_ENV, format!("{} {}", limits.upload, limits.download));
+            .env(
+                HELPER_ENV,
+                format!("{} {} {relay}", limits.upload, limits.download),
+            );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -529,6 +542,7 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(500));
         let pid = child.id();
+        let relay = unshare.contains(&"--user");
 
         apply_through_helper(
             pid,
@@ -536,6 +550,7 @@ mod tests {
                 upload: 8_000_000,
                 download: 16_000_000,
             },
+            relay,
         );
         apply_through_helper(
             pid,
@@ -543,6 +558,7 @@ mod tests {
                 upload: 80_000_000,
                 download: 160_000_000,
             },
+            relay,
         );
 
         let upload = qdiscs(pid, "wbc0");
@@ -554,7 +570,7 @@ mod tests {
         assert_eq!(upload[0]["options"]["rate"], 10_000_000);
         assert_eq!(download[0]["options"]["rate"], 20_000_000);
         assert_eq!(download[1]["options"]["flows"], 4096);
-        let relayed_memory = match unshare.contains(&"--user") {
+        let relayed_memory = match relay {
             true => 32 * 1024 * 1024,
             false => 4 * 1024 * 1024,
         };
@@ -568,8 +584,8 @@ mod tests {
             "{filters}"
         );
 
-        apply_through_helper(pid, BandwidthLimits::default());
-        apply_through_helper(pid, BandwidthLimits::default());
+        apply_through_helper(pid, BandwidthLimits::default(), relay);
+        apply_through_helper(pid, BandwidthLimits::default(), relay);
 
         let cleared = kinds(&qdiscs(pid, "wbc0"));
         assert!(

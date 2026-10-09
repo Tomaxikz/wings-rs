@@ -79,6 +79,7 @@ pub struct InnerServer {
     stopping: AtomicBool,
     last_crash: Mutex<Option<std::time::Instant>>,
     crash_handled: AtomicBool,
+    pub bandwidth_lock: Mutex<()>,
 
     pub user_permissions: permissions::UserPermissionsMap,
     pub filesystem: filesystem::Filesystem,
@@ -242,6 +243,7 @@ impl Server {
             stopping: AtomicBool::new(false),
             last_crash: Mutex::new(None),
             crash_handled: AtomicBool::new(false),
+            bandwidth_lock: Mutex::new(()),
 
             user_permissions: permissions::UserPermissionsMap::default(),
             filesystem,

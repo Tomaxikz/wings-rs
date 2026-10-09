@@ -46,10 +46,6 @@ pub trait ProcessHandle: Send + Sync {
 pub trait ServerExecutor: Send + Sync {
     async fn boot(&self) -> Result<(), anyhow::Error>;
 
-    async fn bandwidth_ready(&self) -> Result<(), anyhow::Error> {
-        anyhow::bail!("bandwidth control is not supported by this executor")
-    }
-
     async fn setup_server_process(
         &self,
         server: &super::Server,

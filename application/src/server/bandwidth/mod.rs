@@ -1,44 +1,52 @@
 pub mod limits;
 
-pub const IFB_DEVICE: &str = "wings-dl";
 #[cfg(target_os = "linux")]
 mod linux;
+
+#[cfg(not(target_os = "linux"))]
+mod linux {
+    use super::limits::BandwidthLimits;
+    use anyhow::{bail, ensure};
+
+    pub async fn ready(_rootless: bool) -> Result<(), anyhow::Error> {
+        bail!("bandwidth limits are only supported on linux")
+    }
+
+    pub async fn apply(
+        _pid: u32,
+        limits: BandwidthLimits,
+        _rootless: bool,
+    ) -> Result<(), anyhow::Error> {
+        ensure!(
+            !limits.is_limited(),
+            "bandwidth limits are only supported on linux"
+        );
+
+        Ok(())
+    }
+}
 
 #[cfg(target_os = "linux")]
 pub use linux::{HELPER_ARG, helper_main};
 
 use anyhow::{Context, ensure};
 use limits::BandwidthLimits;
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock, Weak},
-};
 
-static LOCKS: LazyLock<parking_lot::Mutex<HashMap<uuid::Uuid, Weak<tokio::sync::Mutex<()>>>>> =
-    LazyLock::new(Default::default);
-
-pub fn lock(server: uuid::Uuid) -> Arc<tokio::sync::Mutex<()>> {
-    let mut locks = LOCKS.lock();
-    if let Some(lock) = locks.get(&server).and_then(Weak::upgrade) {
-        return lock;
-    }
-
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    let lock = Arc::new(tokio::sync::Mutex::new(()));
-    locks.insert(server, Arc::downgrade(&lock));
-
-    lock
-}
+pub const IFB_DEVICE: &str = "wings-dl";
 
 const BYPASS_CAPABILITIES: [(u32, &str); 3] =
     [(12, "NET_ADMIN"), (13, "NET_RAW"), (21, "SYS_ADMIN")];
 
-fn validate_capabilities(status: &str) -> Result<(), anyhow::Error> {
-    let bounding = status
+fn capability_mask(status: &str, field: &str) -> Result<u64, anyhow::Error> {
+    status
         .lines()
-        .find_map(|line| line.strip_prefix("CapBnd:"))
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix(':'))
         .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
-        .context("failed to read container capabilities")?;
+        .with_context(|| format!("failed to read {field} capabilities"))
+}
+
+fn validate_capabilities(status: &str) -> Result<(), anyhow::Error> {
+    let bounding = capability_mask(status, "CapBnd")?;
 
     for (bit, name) in BYPASS_CAPABILITIES {
         ensure!(
@@ -50,46 +58,27 @@ fn validate_capabilities(status: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[async_trait::async_trait]
-pub trait BandwidthBackend: Send + Sync {
-    async fn ready(&self) -> Result<(), anyhow::Error>;
-
-    async fn apply(&self, pid: u32, limits: BandwidthLimits) -> Result<(), anyhow::Error>;
-}
-
-#[cfg(not(target_os = "linux"))]
-struct UnsupportedBandwidth;
-
-#[cfg(not(target_os = "linux"))]
-#[async_trait::async_trait]
-impl BandwidthBackend for UnsupportedBandwidth {
-    async fn ready(&self) -> Result<(), anyhow::Error> {
-        anyhow::bail!("bandwidth limits are only supported on linux")
-    }
-
-    async fn apply(&self, _pid: u32, limits: BandwidthLimits) -> Result<(), anyhow::Error> {
-        ensure!(
-            !limits.is_limited(),
-            "bandwidth limits are only supported on linux"
-        );
-
-        Ok(())
-    }
-}
-
-pub fn backend() -> &'static dyn BandwidthBackend {
-    #[cfg(target_os = "linux")]
-    return &linux::NetlinkBandwidth;
-
-    #[cfg(not(target_os = "linux"))]
-    return &UnsupportedBandwidth;
+pub async fn ready(config: &crate::config::Config) -> Result<(), anyhow::Error> {
+    linux::ready(config.load().system.user.rootless.enabled).await
 }
 
 pub async fn apply(
+    config: &crate::config::Config,
     docker: &bollard::Docker,
     container_id: &str,
     limits: BandwidthLimits,
 ) -> Result<(), anyhow::Error> {
+    if !config.load().docker.bandwidth.enabled {
+        if limits.is_limited() {
+            tracing::warn!(
+                container = container_id,
+                "docker.bandwidth is disabled, running the server without its bandwidth limits"
+            );
+        }
+
+        return Ok(());
+    }
+
     let container = docker
         .inspect_container(container_id, None)
         .await
@@ -123,12 +112,14 @@ pub async fn apply(
         validate_capabilities(&status)?;
     }
 
-    backend().apply(pid, limits).await
+    linux::apply(pid, limits, config.load().system.user.rootless.enabled).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // validate_capabilities
 
     fn status(bounding: &str) -> String {
         format!("Name:\tjava\nCapEff:\t0000000000000000\nCapBnd:\t{bounding}\n")
@@ -143,16 +134,5 @@ mod tests {
         assert!(validate_capabilities(&status("00000000002000e1")).is_err());
         assert!(validate_capabilities(&status("000001ffffffffff")).is_err());
         assert!(validate_capabilities("Name:\tjava\n").is_err());
-    }
-
-    #[tokio::test]
-    async fn lock_is_shared_per_server_and_released() {
-        let server = uuid::Uuid::new_v4();
-        let first = lock(server);
-        assert!(Arc::ptr_eq(&first, &lock(server)));
-        assert!(!Arc::ptr_eq(&first, &lock(uuid::Uuid::new_v4())));
-
-        let _guard = first.lock().await;
-        assert!(lock(server).try_lock().is_err());
     }
 }

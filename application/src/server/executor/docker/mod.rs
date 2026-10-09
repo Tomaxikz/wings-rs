@@ -1493,7 +1493,7 @@ struct DockerProcessHandle {
 
     resource_usage: tokio::sync::watch::Sender<super::super::resources::ResourceUsage>,
     publish_resource_usage: bool,
-    bandwidth: bool,
+    shape_bandwidth: bool,
     cfs_lock: Arc<tokio::sync::Mutex<()>>,
     boosted_limit_percent: Arc<AtomicU32>,
     stdin_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -1517,7 +1517,7 @@ impl DockerProcessHandle {
         status_tx: tokio::sync::mpsc::Sender<super::ProcessStatus>,
         publish_resource_usage: bool,
         attach_stdin: bool,
-        bandwidth: bool,
+        shape_bandwidth: bool,
     ) -> Result<Self, anyhow::Error> {
         let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(150);
         let (stdout_ratelimited_tx, stdout_ratelimited_rx) =
@@ -2128,7 +2128,7 @@ impl DockerProcessHandle {
             firewall,
             resource_usage,
             publish_resource_usage,
-            bandwidth,
+            shape_bandwidth,
             cfs_lock,
             boosted_limit_percent,
             stdin_tx,
@@ -2183,21 +2183,21 @@ impl DockerProcessHandle {
 
     async fn apply_bandwidth(
         docker: &bollard::Docker,
+        app_config: &crate::config::Config,
         container_id: &str,
         server: &super::super::InnerServer,
-    ) -> (
-        crate::server::bandwidth::limits::BandwidthLimits,
-        Result<(), anyhow::Error>,
-    ) {
-        let lock = crate::server::bandwidth::lock(server.uuid);
-        let _guard = lock.lock().await;
-
+    ) -> Result<(), anyhow::Error> {
+        let _guard = server.bandwidth_lock.lock().await;
         let limits = server.configuration.read().await.build.bandwidth;
 
-        (
-            limits,
-            crate::server::bandwidth::apply(docker, container_id, limits).await,
-        )
+        match crate::server::bandwidth::apply(app_config, docker, container_id, limits).await {
+            Err(err) if !limits.is_limited() => {
+                tracing::warn!(server = %server.uuid, "failed to clear bandwidth limits: {err:#}");
+
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     async fn begin_startup_boost(&self) -> bool {
@@ -2551,9 +2551,10 @@ impl super::ProcessHandle for DockerProcessHandle {
             .apply_cfs_burst(&self.container_id, &self.app_config)
             .await;
 
-        if self.bandwidth
-            && let (_, Err(err)) =
-                Self::apply_bandwidth(&self.docker, &self.container_id, &server).await
+        if self.shape_bandwidth
+            && let Err(err) =
+                Self::apply_bandwidth(&self.docker, &self.app_config, &self.container_id, &server)
+                    .await
         {
             tracing::error!(server = %server.uuid, "failed to apply bandwidth limits: {err:#}");
         }
@@ -2567,15 +2568,17 @@ impl super::ProcessHandle for DockerProcessHandle {
             .await?;
 
         if let Ok(server) = self.get_server() {
-            if self.bandwidth {
-                let (limits, result) =
-                    Self::apply_bandwidth(&self.docker, &self.container_id, &server).await;
-                if limits.is_limited()
-                    && let Err(err) = result
-                {
-                    self.kill().await.ok();
-                    return Err(err);
-                }
+            if self.shape_bandwidth
+                && let Err(err) = Self::apply_bandwidth(
+                    &self.docker,
+                    &self.app_config,
+                    &self.container_id,
+                    &server,
+                )
+                .await
+            {
+                self.kill().await.ok();
+                return Err(err.context("failed to apply bandwidth limits"));
             }
 
             Self::sync_firewall(
@@ -2792,10 +2795,6 @@ async fn find_running_container(
 
 #[async_trait::async_trait]
 impl super::ServerExecutor for DockerExecutor {
-    async fn bandwidth_ready(&self) -> Result<(), anyhow::Error> {
-        crate::server::bandwidth::backend().ready().await
-    }
-
     async fn boot(&self) -> Result<(), anyhow::Error> {
         self.app_config.ensure_docker_network(&self.docker).await?;
         self.firewall.boot().await?;
@@ -2881,6 +2880,14 @@ impl super::ServerExecutor for DockerExecutor {
             }
         }
 
+        let bandwidth = server.configuration.read().await.build.bandwidth;
+        if self.app_config.load().docker.bandwidth.enabled
+            && bandwidth.is_limited()
+            && let Err(err) = crate::server::bandwidth::ready(&self.app_config).await
+        {
+            return Err(err.context("failed to apply bandwidth limits"));
+        }
+
         let container = self
             .docker
             .create_container(
@@ -2937,8 +2944,13 @@ impl super::ServerExecutor for DockerExecutor {
             .apply_cfs_burst(&container_id, &self.app_config)
             .await;
 
-        if let (_, Err(err)) =
-            DockerProcessHandle::apply_bandwidth(&self.docker, &container_id, server).await
+        if let Err(err) = DockerProcessHandle::apply_bandwidth(
+            &self.docker,
+            &self.app_config,
+            &container_id,
+            server,
+        )
+        .await
         {
             tracing::error!(server = %server.uuid, "failed to apply bandwidth limits: {err:#}");
         }

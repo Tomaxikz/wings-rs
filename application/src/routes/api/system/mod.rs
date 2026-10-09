@@ -15,12 +15,12 @@ mod get {
         response::{ApiResponse, ApiResponseResult},
         routes::GetState,
     };
-    use anyhow::Context;
     use serde::Serialize;
     use utoipa::ToSchema;
 
     #[derive(ToSchema, Serialize)]
     struct BandwidthStatus {
+        enabled: bool,
         ready: bool,
         reason: Option<String>,
     }
@@ -39,13 +39,16 @@ mod get {
         (status = OK, body = inline(Response)),
     ))]
     pub async fn route(state: GetState) -> ApiResponseResult {
-        let result = tokio::time::timeout(
+        let enabled = state.config.load().docker.bandwidth.enabled;
+        let result = match tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            state.executor.bandwidth_ready(),
+            crate::server::bandwidth::ready(&state.config),
         )
         .await
-        .context("bandwidth readiness check timed out")
-        .and_then(|result| result);
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("bandwidth readiness check timed out")),
+        };
 
         ApiResponse::new_serialized(Response {
             architecture: std::env::consts::ARCH,
@@ -54,6 +57,7 @@ mod get {
             os: std::env::consts::OS,
             version: &state.version,
             bandwidth: BandwidthStatus {
+                enabled,
                 ready: result.is_ok(),
                 reason: result.err().map(|err| format!("{err:#}")),
             },
